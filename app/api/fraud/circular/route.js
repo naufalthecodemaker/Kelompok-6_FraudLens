@@ -1,55 +1,82 @@
-// app/api/fraud/circular/route.js
 import { NextResponse } from 'next/server';
 import driver from '@/lib/neo4j';
 
-export async function GET() {
+export async function GET(request) {
+  const { searchParams } = new URL(request.url);
+  const target = searchParams.get('target') || '';
+  const searchQuery = target.trim().toLowerCase();
+
+  if (!searchQuery) {
+    return NextResponse.json({ success: true, data: { nodes: [], links: [] } });
+  }
+
   const session = driver.session();
   
   try {
     const query = `
-      MATCH (source)-[relationship]->(target)
-      RETURN source, relationship, target
+      MATCH (u:User)
+      WHERE toLower(u.name) CONTAINS $searchQuery
+      OPTIONAL MATCH path = (u)-[*1..2]-(connectedNode)
+      RETURN path, u
     `;
     
-    const result = await session.run(query);
+    const result = await session.run(query, { searchQuery });
     
     const nodesMap = new Map();
     const links = [];
 
-    result.records.forEach((record) => {
-      const sourceNode = record.get('source');
-      const targetNode = record.get('target');
-      const rel = record.get('relationship');
+    if (result.records.length === 0 || !result.records[0].get('u')) {
+      return NextResponse.json({ success: true, data: { nodes: [], links: [] } });
+    }
 
-      const sourceId = sourceNode.properties.id;
-      const targetId = targetNode.properties.id;
+    result.records.forEach(record => {
+      const path = record.get('path');
+      const mainUser = record.get('u');
 
-      if (!nodesMap.has(sourceId)) {
-        nodesMap.set(sourceId, {
-          ...sourceNode.properties, 
-          label: sourceNode.labels[0],
+      if (mainUser && !nodesMap.has(mainUser.elementId)) {
+        nodesMap.set(mainUser.elementId, {
+          id: mainUser.properties.id || mainUser.elementId,
+          label: mainUser.labels[0],
+          ...mainUser.properties
         });
       }
 
-      if (!nodesMap.has(targetId)) {
-        nodesMap.set(targetId, {
-          ...targetNode.properties,
-          label: targetNode.labels[0],
+      if (path) {
+        path.segments.forEach(segment => {
+          const start = segment.start;
+          const end = segment.end;
+          const rel = segment.relationship;
+
+          if (!nodesMap.has(start.elementId)) {
+            nodesMap.set(start.elementId, {
+              id: start.properties.id || start.elementId,
+              label: start.labels[0],
+              ...start.properties
+            });
+          }
+
+          if (!nodesMap.has(end.elementId)) {
+            nodesMap.set(end.elementId, {
+              id: end.properties.id || end.elementId,
+              label: end.labels[0],
+              ...end.properties
+            });
+          }
+
+          let cleanAmount = rel.properties.amount;
+          if (cleanAmount && typeof cleanAmount === 'object' && cleanAmount.low !== undefined) {
+            cleanAmount = cleanAmount.toNumber(); 
+          }
+
+          links.push({
+            source: start.properties.id || start.elementId,
+            target: end.properties.id || end.elementId,
+            type: rel.type,
+            amount: cleanAmount,
+            ...rel.properties
+          });
         });
       }
-
-      let cleanAmount = rel.properties.amount;
-      if (cleanAmount && typeof cleanAmount === 'object' && cleanAmount.low !== undefined) {
-        cleanAmount = cleanAmount.toNumber(); 
-      }
-
-      links.push({
-        ...rel.properties, 
-        source: sourceId, 
-        target: targetId, 
-        type: rel.type,
-        amount: cleanAmount 
-      });
     });
 
     const formattedData = {
